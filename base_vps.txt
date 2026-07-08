@@ -1,0 +1,406 @@
+# VPS Setup Guide - Ubuntu 24.04 LTS
+# Last Updated: January 2026
+
+This is my barebones VPS setup for hosting web applications.
+It covers security hardening, web server setup, and FastAPI deployment.
+
+================================================================================
+PART 1: BASE VPS SECURITY SETUP
+================================================================================
+
+## Create Linode Server (or any VPS provider)
+
+    -> Create Linode
+    -> Latest version of Ubuntu (24.04 LTS)
+    -> Choose Region (I chose Dallas, TX "us-central")
+    -> Choose a Linode Plan (Shared CPU with 1GB RAM for $5/mo works for small sites)
+    -> Give it a label (e.g., fastapi-blog)
+    -> Use a Strong Root Password
+    -> Create Linode
+
+This will give you a public IP address to login to the server.
+
+--------------------------------------------------------------------------------
+
+## Initial Login and System Update
+
+    -> Copy your Public IP from the dashboard
+    -> Login as root (first and last time!)
+        ssh root@YOUR_IP_ADDRESS
+
+    -> Update the system
+        apt update && apt upgrade -y
+
+        # You may be prompted about modified config files (like /etc/ssh/sshd_config).
+        # Since this is a fresh install, accept the maintainer's version.
+
+--------------------------------------------------------------------------------
+
+## Create Non-Root User
+
+    -> Create a new user
+        adduser coreyms
+        # Enter a strong password when prompted
+
+    -> Grant sudo privileges
+        usermod -aG sudo coreyms
+
+    -> Verify the user has sudo
+        groups coreyms
+        # Should show: coreyms : coreyms sudo
+
+--------------------------------------------------------------------------------
+
+## Set Up SSH Key Authentication (Do this BEFORE disabling password auth!)
+
+    -> On your LOCAL machine (not the server!), generate an Ed25519 key:
+        ssh-keygen -t ed25519 -C "YourName - DeviceName - Date"
+
+        # The -C comment gets embedded in the public key. When you view
+        # authorized_keys on the server, you'll see who/what is allowed to connect.
+        # Example:
+        ssh-keygen -t ed25519 -C "CoreyMS - MacBook Pro - 2025-01"
+
+    -> When prompted for file location, use a descriptive name:
+        /Users/yourname/.ssh/id_ed25519_fastapiblog_macbookpro
+
+        # Format: id_ed25519_<server>_<device>
+        # This way you know which server and which device at a glance
+
+    -> Enter a strong passphrase (protects the key if your machine is compromised)
+
+    -> Copy the public key to your server (still on local machine):
+        ssh-copy-id -i ~/.ssh/id_ed25519_fastapiblog_macbookpro coreyms@YOUR_IP_ADDRESS
+        # Enter the password for coreyms when prompted
+
+    -> Add the key to your SSH agent (so you don't have to specify -i every time):
+        ssh-add ~/.ssh/id_ed25519_fastapiblog_macbookpro
+
+    -> Test login with the new user (IMPORTANT: Do this before disabling password auth!)
+        ssh coreyms@YOUR_IP_ADDRESS
+        # Should log in without asking for password (may ask for key passphrase)
+
+    -> Verify SSH directory permissions on the server (ssh-copy-id usually sets these,
+       but SSH is strict - it won't work if permissions are too open):
+        chmod 700 ~/.ssh
+        chmod 600 ~/.ssh/*
+
+    -> If it works, you can now exit and continue as the new user
+
+--------------------------------------------------------------------------------
+
+## Harden SSH Configuration
+
+    -> Now logged in as your non-root user, edit the SSH config:
+        sudo nano /etc/ssh/sshd_config
+
+    -> Find and change these settings (uncomment if needed):
+
+        # Disable root login entirely
+        PermitRootLogin no
+
+        # Ensure public key authentication is enabled
+        PubkeyAuthentication yes
+
+        # Disable password authentication (keys only!)
+        PasswordAuthentication no
+
+        # Disable empty passwords
+        PermitEmptyPasswords no
+
+        # Disable challenge-response (another password method)
+        KbdInteractiveAuthentication no
+
+    -> Save and exit (Ctrl+X, Y, Enter)
+
+    -> Restart SSH service
+        sudo systemctl restart ssh
+
+    -> IMPORTANT: Before closing your current session, open a NEW terminal and test:
+        ssh coreyms@YOUR_IP_ADDRESS
+        # If this works, you're safe. If not, use your current session to fix it!
+
+--------------------------------------------------------------------------------
+
+## Set Timezone
+
+    -> Check current timezone
+        timedatectl status
+
+    -> List available timezones (optional)
+        timedatectl list-timezones
+        timedatectl list-timezones | grep America
+
+    -> Set your timezone (I use UTC for servers, but use your preference)
+        sudo timedatectl set-timezone UTC
+
+        # Or for a specific region:
+        # sudo timedatectl set-timezone America/Chicago
+
+    -> Verify
+        timedatectl status
+
+--------------------------------------------------------------------------------
+
+## Configure Hostname
+
+    -> Set hostname
+        sudo hostnamectl set-hostname fastapi-blog
+
+    -> Verify
+        hostname
+
+    -> Add to hosts file
+        sudo nano /etc/hosts
+
+    -> Add this line under 127.0.0.1 (use your server's public IP, not your local IP):
+        YOUR_SERVER_IP fastapi-blog
+
+    -> Save and exit
+
+--------------------------------------------------------------------------------
+
+## Set Up Firewall (UFW)
+
+    -> Install UFW (usually pre-installed on Ubuntu)
+        sudo apt install ufw -y
+
+    -> Set default policies
+        sudo ufw default deny incoming
+        sudo ufw default allow outgoing
+
+    -> Allow SSH (do this BEFORE enabling!)
+        sudo ufw allow ssh
+
+    -> Allow HTTP and HTTPS
+        sudo ufw allow 80/tcp
+        sudo ufw allow 443/tcp
+
+    -> Enable the firewall
+        sudo ufw enable
+        # Type 'y' to confirm
+
+    -> Verify status
+        sudo ufw status verbose
+
+--------------------------------------------------------------------------------
+
+## Set Up Fail2Ban (Brute Force Protection)
+
+    -> Install Fail2Ban
+        sudo apt install fail2ban -y
+
+    -> Create local config files (never edit the .conf files directly)
+        sudo cp /etc/fail2ban/fail2ban.conf /etc/fail2ban/fail2ban.local
+        sudo cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
+
+    -> Edit the jail.local config
+        sudo nano /etc/fail2ban/jail.local
+
+    -> Find the [DEFAULT] section and set banaction to use UFW:
+        [DEFAULT]
+        # Use UFW for banning instead of raw iptables (keeps everything in one place)
+        banaction = ufw
+
+    -> Optional: Add your IP to the ignore list (still in [DEFAULT] section):
+        ignoreip = 127.0.0.1/8 ::1 YOUR_HOME_IP
+
+    -> Find the [sshd] section and ensure these values:
+        [sshd]
+        enabled = true
+        port = ssh
+        filter = sshd
+        maxretry = 3
+        bantime = 1h
+        findtime = 10m
+        logpath = %(sshd_log)s
+        backend = %(sshd_backend)s
+
+    -> Save and exit
+
+    -> Start and enable Fail2Ban
+        sudo systemctl start fail2ban
+        sudo systemctl enable fail2ban
+        sudo systemctl status fail2ban
+
+    -> Check banned IPs (after some time)
+        sudo fail2ban-client status sshd
+
+--------------------------------------------------------------------------------
+
+## Enable Automatic Security Updates
+
+    # Note: unattended-upgrades only applies SECURITY updates by default,
+    # not all package updates. You're not getting bleeding-edge software -
+    # just security fixes for known vulnerabilities. This is the official
+    # Ubuntu tool for automatic updates, pre-installed and enabled by default.
+
+    -> Install unattended-upgrades (usually pre-installed)
+        sudo apt install unattended-upgrades -y
+
+    -> Enable automatic updates
+        sudo dpkg-reconfigure -plow unattended-upgrades
+        # Select "Yes" when prompted
+
+    -> Verify configuration
+        cat /etc/apt/apt.conf.d/20auto-upgrades
+        # Should show:
+        # APT::Periodic::Update-Package-Lists "1";
+        # APT::Periodic::Unattended-Upgrade "1";
+
+    -> Optional: Configure automatic reboot for kernel updates
+        sudo nano /etc/apt/apt.conf.d/50unattended-upgrades
+
+        # Uncomment and modify these lines:
+        Unattended-Upgrade::Automatic-Reboot "true";
+        Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+
+        # Note: Only enable auto-reboot if you're okay with brief downtime
+        # Many prefer to manually reboot during maintenance windows
+
+    -> Check when updates last ran
+        cat /var/log/unattended-upgrades/unattended-upgrades.log
+
+================================================================================
+PART 2: WEB SERVER SETUP (NGINX)
+================================================================================
+
+## Install NGINX
+
+    -> Update packages and install
+        sudo apt update
+        sudo apt install nginx -y
+
+    -> Start and enable NGINX
+        sudo systemctl start nginx
+        sudo systemctl enable nginx
+        sudo systemctl status nginx
+
+    -> Test by visiting your IP in a browser
+        http://YOUR_IP_ADDRESS
+        # Should see the NGINX welcome page
+
+    -> Note on /var/www/html ownership:
+        # By default, /var/www/html is owned by root. NGINX (running as www-data)
+        # only needs READ access to serve files, which it has by default.
+        #
+        # You'd only change ownership to www-data if your web app needs to WRITE
+        # files to this directory (common with PHP apps, file upload systems, etc.)
+        #
+        # For our FastAPI setup, we don't need this because:
+        #   - Our app lives in /var/www/fastapi-blog (owned by our user)
+        #   - User uploads go to S3, not local filesystem
+        #
+        # But if you ever need it, here's how:
+        # sudo chown -R www-data:www-data /var/www/html
+        # sudo chmod -R 755 /var/www/html
+
+--------------------------------------------------------------------------------
+
+## Point Your Domain to the Server
+
+    Before configuring nginx for your domain, you need to point your domain's
+    DNS to your server. In your domain registrar (e.g., Namecheap):
+
+    -> Go to Domain List → Manage → Advanced DNS
+
+    -> Delete any existing A records or CNAME records for @ and www
+       (Namecheap may have default "parking" records)
+
+    -> Add two A records:
+        Type: A Record    Host: @      Value: YOUR_SERVER_IP    TTL: Automatic
+        Type: A Record    Host: www    Value: YOUR_SERVER_IP    TTL: Automatic
+
+    -> Save changes
+
+    -> DNS propagation can take up to 48 hours (usually 5-30 minutes)
+
+    -> Test propagation (+short gives just the IP without extra DNS details):
+        dig yourdomain.com +short
+        dig www.yourdomain.com +short
+        # Both should return your server IP
+
+    Note: We're using simple A records rather than Linode's nameservers.
+    This keeps DNS management at your registrar, which is simpler for a
+    single server. Linode's nameserver approach (ns1.linode.com, etc.) is
+    useful if you want to manage everything in one place.
+
+--------------------------------------------------------------------------------
+
+## Configure NGINX for Your Domain
+
+    -> Create a site configuration
+        sudo nano /etc/nginx/sites-available/yourdomain.com
+
+    -> Add this configuration (we'll update it for FastAPI later):
+
+        # Redirect www to non-www
+        server {
+            listen 80;
+            listen [::]:80;
+            server_name www.yourdomain.com;
+            return 301 $scheme://yourdomain.com$request_uri;
+        }
+
+        # Main server block
+        server {
+            listen 80;
+            listen [::]:80;
+            server_name yourdomain.com;
+
+            # Temporary: serve static files (will change for FastAPI)
+            root /var/www/html;
+            index index.html;
+
+            location / {
+                try_files $uri $uri/ =404;
+            }
+        }
+
+    -> Enable the site with a symlink
+        sudo ln -s /etc/nginx/sites-available/yourdomain.com /etc/nginx/sites-enabled/
+
+    -> Remove default site (optional)
+        sudo rm /etc/nginx/sites-enabled/default
+
+    -> Test configuration
+        sudo nginx -t
+
+    -> Reload NGINX
+        sudo systemctl reload nginx
+
+--------------------------------------------------------------------------------
+
+## SSL/TLS Certificate (Let's Encrypt)
+
+    -> Install Certbot via Snap (recommended method)
+        sudo apt update
+        sudo apt install snapd -y
+        sudo snap install core
+        sudo snap refresh core
+
+    -> Remove any old certbot if present
+        sudo apt remove certbot -y
+
+    -> Install Certbot
+        sudo snap install --classic certbot
+
+    -> Create symlink for easier access
+        sudo ln -s /snap/bin/certbot /usr/bin/certbot
+
+    -> Confirm DNS has propagated before running Certbot (Certbot will fail if DNS isn't ready). If it isn't ready, wait.
+        dig yourdomain.com +short
+        # Should return your server's IP
+
+    -> Obtain certificate (replace with your domain)
+        sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
+        # Follow the prompts, enter your email, agree to terms
+
+    -> Test automatic renewal
+        sudo certbot renew --dry-run
+
+    -> Verify renewal timer is active
+        systemctl list-timers | grep certbot
+        # Should show snap.certbot.renew.timer
+
+    -> Your site should now be accessible via HTTPS!
