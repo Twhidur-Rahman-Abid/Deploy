@@ -1,0 +1,334 @@
+## Install Python and UV
+
+    -> Install Python and required packages
+        sudo apt update
+        sudo apt install python3 python3-pip python3-venv git -y
+
+    -> Verify Python version (should be 3.12+ on Ubuntu 24.04)
+        python3 --version
+
+    -> Install UV (fast Python package manager)
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+
+        # The installer automatically updates ~/.bashrc to add UV to your PATH.
+        # If for some reason it doesn't, add it manually:
+        # echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+
+    -> Reload your shell to pick up the PATH changes
+        source ~/.bashrc
+
+    -> Verify UV installation
+        uv --version
+
+--------------------------------------------------------------------------------
+
+## Install and Configure PostgreSQL
+
+    -> Install PostgreSQL
+        sudo apt update
+        sudo apt install postgresql postgresql-contrib -y
+
+    -> Start and enable PostgreSQL
+        sudo systemctl start postgresql
+        sudo systemctl enable postgresql
+        sudo systemctl status postgresql
+
+    -> Create a database user and database for your app
+        sudo -u postgres psql
+
+        # In the PostgreSQL prompt:
+        CREATE USER bloguser WITH PASSWORD 'your_secure_password';
+        CREATE DATABASE blog OWNER bloguser;
+        GRANT ALL PRIVILEGES ON DATABASE blog TO bloguser;
+        \q
+
+    -> Test the connection
+        psql -U bloguser -d blog -h localhost
+        # Enter password when prompted
+        # Type \q to exit
+
+    -> Note your connection string for later:
+        postgresql+psycopg://bloguser:your_secure_password@localhost/blog
+
+--------------------------------------------------------------------------------
+
+## Deploy Your FastAPI Application
+
+    -> Create a directory for your application
+        sudo mkdir -p /var/www/fastapi-blog
+        sudo chown $USER:$USER /var/www/fastapi-blog
+
+    -> Clone your repository (or copy files)
+        cd /var/www/fastapi-blog
+        git clone https://github.com/yourusername/your-repo.git .
+
+        # Or if using a private repo, set up deploy keys first
+
+        # Alternative: Copy files from your local machine using scp
+        # Run this on your LOCAL machine (not the server):
+        # scp -r /path/to/your/project/* coreyms@YOUR_IP_ADDRESS:/var/www/fastapi-blog/
+
+    -> Set secure file permissions (deny by default, then open what's needed)
+
+        # Lock down everything first: owner read/write only for files,
+        # owner read/write/execute only for directories
+        find . -type f -exec chmod 600 {} \;
+        find . -type d -exec chmod 700 {} \;
+
+        # Open up what nginx (www-data) needs: it must traverse the project
+        # directory and read static files
+        chmod 755 .
+        chmod -R 755 static
+
+    -> Create virtual environment and install dependencies with UV
+        # (should already be in /var/www/fastapi-blog from previous step)
+        uv sync
+
+    -> Create your .env file
+        # Generate a secure secret key with:
+        python3 -c "import secrets; print(secrets.token_hex(32))"
+
+        # Copy the key
+        
+        nano .env
+
+        # Add your environment variables:
+        DATABASE_URL=postgresql+psycopg://bloguser:your_secure_password@localhost/blog
+        SECRET_KEY=PASTE_THE_KEY
+        MAIL_SERVER=smtp.yourprovider.com
+        MAIL_PORT=587
+        MAIL_USERNAME=your_email
+        MAIL_PASSWORD=your_app_password
+        MAIL_FROM=noreply@yourdomain.com
+        MAIL_USE_TLS=true
+        FRONTEND_URL=https://yourdomain.com
+        S3_BUCKET_NAME=your-bucket
+        S3_REGION=us-east-1
+        # etc...
+
+    -> Secure the .env file
+        chmod 600 .env
+
+    -> Run database migrations
+        cd /var/www/fastapi-blog
+        uv run alembic upgrade head
+
+    -> Test the application manually
+
+        # Temporarily open port 8000 in the firewall for testing
+        sudo ufw allow 8000/tcp
+
+        uv run fastapi run --host 0.0.0.0 --port 8000
+        # Visit http://YOUR_IP:8000 to test
+        # Ctrl+C to stop
+
+        # Close the temporary port (nginx will handle traffic from here on)
+        sudo ufw delete allow 8000/tcp
+
+--------------------------------------------------------------------------------
+
+## Set Up FastAPI with systemd
+
+    # Note: The traditional "Gunicorn + Uvicorn workers" pattern still works,
+    # but uvicorn.workers.UvicornWorker is deprecated. Plain Uvicorn (or the
+    # FastAPI CLI) with --workers is simpler and recommended now. systemd
+    # handles process lifecycle (restart on crash, start on boot).
+
+    -> Create a systemd service file
+        sudo nano /etc/systemd/system/fastapi-blog.service
+
+    -> Add this configuration:
+
+        [Unit]
+        Description=FastAPI Blog Application
+        After=network.target postgresql.service
+        Wants=postgresql.service
+
+        [Service]
+        User=coreyms
+        Group=www-data
+        WorkingDirectory=/var/www/fastapi-blog
+        Environment="PATH=/var/www/fastapi-blog/.venv/bin"
+        EnvironmentFile=/var/www/fastapi-blog/.env
+        # Set --workers to your CPU core count. Check with: nproc
+        # For async workers, use 1 worker per core (not the old 2*cores+1 formula)
+        # --proxy-headers tells Uvicorn to trust X-Forwarded-* headers from nginx
+        ExecStart=/var/www/fastapi-blog/.venv/bin/fastapi run \
+            --workers 1 \
+            --host 127.0.0.1 \
+            --port 8000 \
+            --proxy-headers
+        Restart=always
+        RestartSec=5
+
+        # Note: Uvicorn only trusts forwarded headers from 127.0.0.1 by default.
+        # Since nginx runs on the same server (localhost), this works. If nginx
+        # were on a different server, you'd also need --forwarded-allow-ips="x.x.x.x"
+
+        [Install]
+        WantedBy=multi-user.target
+
+    -> Reload systemd and start the service
+        sudo systemctl daemon-reload
+        sudo systemctl start fastapi-blog
+        sudo systemctl enable fastapi-blog
+
+    -> Check status
+        sudo systemctl status fastapi-blog
+
+    -> View logs (systemd captures stdout/stderr automatically)
+        sudo journalctl -u fastapi-blog -f              # Follow logs in real-time
+        sudo journalctl -u fastapi-blog --since "1 hour ago"  # Recent logs
+        sudo journalctl -u fastapi-blog -n 100          # Last 100 lines
+
+--------------------------------------------------------------------------------
+
+## Configure NGINX as Reverse Proxy for FastAPI
+
+    -> Update your NGINX configuration
+        sudo nano /etc/nginx/sites-available/yourdomain.com
+
+    -> Replace the contents with:
+
+        # Redirect www to non-www
+        server {
+            listen 80;
+            listen [::]:80;
+            server_name www.yourdomain.com;
+            return 301 https://yourdomain.com$request_uri;
+        }
+
+        # Redirect HTTP to HTTPS
+        server {
+            listen 80;
+            listen [::]:80;
+            server_name yourdomain.com;
+            return 301 https://$server_name$request_uri;
+        }
+
+        # Main HTTPS server block
+        server {
+            listen 443 ssl http2;
+            listen [::]:443 ssl http2;
+            server_name yourdomain.com;
+
+            # SSL certificates (managed by Certbot)
+            ssl_certificate /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+            ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
+            include /etc/letsencrypt/options-ssl-nginx.conf;
+            ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+            # Security headers
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            # HSTS: Tell browsers to always use HTTPS (max-age is 2 years)
+            # "preload" allows submission to browser preload lists (hstspreload.org)
+            add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+            # Serve static files directly
+            location /static/ {
+                alias /var/www/fastapi-blog/static/;
+                expires 30d;
+                add_header Cache-Control "public, immutable";
+            }
+
+            # Proxy to FastAPI
+            location / {
+                proxy_pass http://127.0.0.1:8000;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+
+                # WebSocket support (if needed)
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "upgrade";
+
+                # Timeouts
+                proxy_connect_timeout 60s;
+                proxy_send_timeout 60s;
+                proxy_read_timeout 60s;
+            }
+
+            # File upload size limit (matches our app's max_upload_size_bytes setting)
+            client_max_body_size 5M;
+        }
+
+    -> Test configuration
+        sudo nginx -t
+
+    -> Reload NGINX
+        sudo systemctl reload nginx
+
+    -> Your FastAPI app should now be live at https://yourdomain.com!
+
+--------------------------------------------------------------------------------
+
+## Useful Commands for Maintenance
+
+    # Check application status
+    sudo systemctl status fastapi-blog
+
+    # Restart application (after code changes)
+    sudo systemctl restart fastapi-blog
+
+    # View application logs
+    sudo journalctl -u fastapi-blog -f
+
+    # View NGINX logs
+    sudo tail -f /var/log/nginx/access.log
+    sudo tail -f /var/log/nginx/error.log
+
+    # Update application code
+    cd /var/www/fastapi-blog
+    git pull
+    uv sync
+    uv run alembic upgrade head
+    sudo systemctl restart fastapi-blog
+
+    # Check disk space
+    df -h
+
+    # Check memory usage
+    free -h
+
+    # Check running processes
+    htop
+
+================================================================================
+NOTES AND REMINDERS
+================================================================================
+
+## Security Checklist
+
+    [x] Non-root user with sudo
+    [x] SSH key authentication only (no passwords)
+    [x] Root login disabled
+    [x] Firewall enabled (UFW)
+    [x] Fail2Ban protecting SSH (integrated with UFW)
+    [x] Automatic security updates enabled
+    [x] File permissions locked down (deny by default)
+    [x] SSL/TLS certificate installed
+    [x] Security headers in NGINX (including HSTS with preload)
+    [x] Uvicorn configured with --proxy-headers for nginx
+
+## File Storage
+
+    Our FastAPI app uses S3 for file uploads (profile pictures).
+    No server-side file storage configuration needed.
+    Static files (CSS, JS, default images) are served from /static/.
+
+## Database Backups (TODO for production)
+
+    Consider setting up automated PostgreSQL backups:
+    - pg_dump with cron
+    - Or a managed backup service
+
+## Monitoring (TODO for production)
+
+    Consider adding:
+    - Uptime monitoring (UptimeRobot, Pingdom)
+    - Error tracking (Sentry)
+    - Log aggregation (if needed)
